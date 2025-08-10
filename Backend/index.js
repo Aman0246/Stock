@@ -200,6 +200,102 @@ app.post('/api/aggregate/daily-sector-summary', async (req, res) => {
     }
 });
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// Helper: get moving average avgChangePercent over last N days for a sector
+async function getMovingAvg(sectorSummaryCol, sector, endDate, days = 3) {
+    const fromDate = moment(endDate).subtract(days - 1, 'days').format('YYYY-MM-DD');
+    const records = await sectorSummaryCol.find({
+        sector,
+        date: { $gte: fromDate, $lte: endDate }
+    }).toArray();
+    if (!records.length) return null;
+    const sum = records.reduce((acc, r) => acc + r.avgChangePercent, 0);
+    return sum / records.length;
+}
+
+app.get('/api/trading-signal', async (req, res) => {
+    try {
+        const date = req.query.date || moment().format('YYYY-MM-DD');
+        const yesterday = moment(date).subtract(1, 'day').format('YYYY-MM-DD');
+
+        const todayRanking = await sectorSummaryCol.find({ date }).sort({ avgChangePercent: -1 }).toArray();
+        const yesterdayRanking = await sectorSummaryCol.find({ date: yesterday }).sort({ avgChangePercent: -1 }).toArray();
+
+        if (!todayRanking.length || !yesterdayRanking.length) {
+            return res.status(404).json({ error: 'Insufficient data for the specified dates' });
+        }
+
+        const currentLeaderToday = todayRanking[0];
+        const nextLeaderToday = todayRanking.find(s => s.sector !== currentLeaderToday.sector) || null;
+
+        const currentLeader3DayAvg = await getMovingAvg(sectorSummaryCol, currentLeaderToday.sector, date, 3);
+        const nextLeader3DayAvg = nextLeaderToday
+            ? await getMovingAvg(sectorSummaryCol, nextLeaderToday.sector, date, 3)
+            : null;
+
+        // Today's actual changePercent for extra detail
+        const currentLeaderTodayChange = currentLeaderToday.avgChangePercent;
+        const nextLeaderTodayChange = nextLeaderToday ? nextLeaderToday.avgChangePercent : null;
+
+        const threshold = 0.5; // percentage points threshold to switch sectors
+
+        let signal = 'HOLD';
+        let reason = 'No significant changes detected';
+
+        if (currentLeader3DayAvg === null) {
+            signal = 'HOLD';
+            reason = `Insufficient moving average data for current leader (${currentLeaderToday.sector})`;
+        } else if (nextLeader3DayAvg === null) {
+            // No next leader data - stick with current leader
+            signal = 'BUY_CURRENT_HOLD_OTHERS';
+            reason = `No next leader data; holding current leader (${currentLeaderToday.sector})`;
+        } else {
+            if ((currentLeader3DayAvg + threshold) < nextLeader3DayAvg) {
+                signal = 'SELL_CURRENT_BUY_NEXT';
+                reason = `Current leader 3-day avg (${currentLeader3DayAvg.toFixed(2)}%) weaker than next leader 3-day avg (${nextLeader3DayAvg.toFixed(2)}%) by >${threshold}%`;
+            } else {
+                signal = 'BUY_CURRENT_HOLD_OTHERS';
+                reason = `Current leader remains stronger or no significant difference`;
+            }
+        }
+
+        res.json({
+            date,
+            currentLeader: currentLeaderToday.sector,
+            nextLeader: nextLeaderToday ? nextLeaderToday.sector : null,
+            signal,
+            reason,
+            details: {
+                currentLeader: {
+                    "3DayAvgChangePercent": Number(currentLeader3DayAvg?.toFixed(2)) || null,
+                    "todayChangePercent": Number(currentLeaderTodayChange.toFixed(2))
+                },
+                nextLeader: {
+                    "3DayAvgChangePercent": Number(nextLeader3DayAvg?.toFixed(2)) || null,
+                    "todayChangePercent": nextLeaderTodayChange !== null ? Number(nextLeaderTodayChange.toFixed(2)) : null
+                }
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
     console.log(`API server running on port ${PORT}`);
