@@ -1,8 +1,10 @@
 import express from 'express';
 import { MongoClient } from 'mongodb';
 import moment from 'moment';
+import cors from 'cors';
 
 const app = express();
+app.use(cors());
 app.use(express.json());
 
 const MONGO_URI = "mongodb+srv://amankashyap0246jploft:kprUz7Puu9cS9zkl@cluster0.bqz0rdo.mongodb.net/Secerate";
