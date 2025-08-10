@@ -47,8 +47,11 @@ async function fetchSectorData(sector, page, collection) {
         high: stock.dayHigh,
         low: stock.dayLow,
         close: stock.lastPrice,
-        change: stock.pChange,
-        // optionally add more fields here like volume, etc.
+        previousClose: stock.previousClose,
+        changeAbsolute: stock.change,
+        changePercent: stock.pChange,
+        volume: stock.totalTradedVolume,
+        turnover: stock.totalTradedValue,
     }));
 
     // Upsert each doc in MongoDB (sector + date + symbol uniqueness)
