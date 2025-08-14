@@ -20,281 +20,216 @@ async function connectDb() {
     sectorSummaryCol = db.collection('sector_summary');
 }
 
-connectDb();
+connectDb().then(e => {
+    console.log("connected")
+});
 
 // Helper: get previous date string in YYYY-MM-DD
 function prevDate(dateStr) {
     return moment(dateStr).subtract(1, 'day').format('YYYY-MM-DD');
 }
 
-// 1. Get sector strength ranking for a given date (default today)
+// sector ranking based on Days defaut 5 days with moving average Data
 app.get('/api/sectors/ranking', async (req, res) => {
     try {
-        const date = req.query.date || moment().format('YYYY-MM-DD');
+        const days = parseInt(req.query.days) || 5;
+        const gapThreshold = parseFloat(req.query.threshold) || 0.2; // % difference
+        const endDate = moment(req.query.date || undefined).endOf('day');
+        const startDate = moment(endDate).subtract(days, 'days').startOf('day');
 
-        // Aggregate average % change and total volume per sector
-        const pipeline = [
-            { $match: { date } },
-            {
-                $group: {
-                    _id: "$sector",
-                    avgChangePercent: { $avg: "$changePercent" },
-                    totalVolume: { $sum: "$volume" },
-                    totalTurnover: { $sum: "$turnover" },
-                }
-            },
-            {
-                $project: {
-                    sector: "$_id",
-                    avgChangePercent: 1,
-                    totalVolume: 1,
-                    totalTurnover: 1,
-                    _id: 0
-                }
-            },
-            { $sort: { avgChangePercent: -1 } }
-        ];
 
-        const ranking = await sectorIndicesCol.aggregate(pipeline).toArray();
-
-        res.json({ date, ranking });
-
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// 2. Get sector strength trend (strengthening, weakening, stable) between today and yesterday
-app.get('/api/sectors/trend', async (req, res) => {
-    try {
-        const date = req.query.date || moment().format('YYYY-MM-DD');
-        const yesterday = prevDate(date);
-
-        // Fetch today sector summary or calculate on the fly
-        const todaySummary = await sectorSummaryCol.find({ date }).toArray();
-        if (!todaySummary.length) {
-            return res.status(404).json({ error: "No summary data for today. Run aggregation first." });
-        }
-
-        const yesterdaySummary = await sectorSummaryCol.find({ date: yesterday }).toArray();
-        if (!yesterdaySummary.length) {
-            return res.status(404).json({ error: "No summary data for yesterday. Run aggregation first." });
-        }
-
-        // Map yesterday summary by sector for quick lookup
-        const yestMap = {};
-        yesterdaySummary.forEach(s => { yestMap[s.sector] = s; });
-
-        // Compute trend for each sector
-        const trends = todaySummary.map(today => {
-            const yest = yestMap[today.sector];
-            if (!yest) return { sector: today.sector, trend: 'no data for yesterday', delta: null };
-
-            const delta = today.avgChangePercent - yest.avgChangePercent;
-            const trend = delta > 0 ? 'strengthening' : delta < 0 ? 'weakening' : 'stable';
-
-            return {
-                sector: today.sector,
-                date,
-                avgChangePercent: today.avgChangePercent,
-                trend,
-                delta: +delta.toFixed(4),
-                totalVolume: today.totalVolume,
-                totalTurnover: today.totalTurnover
-            };
-        });
-
-        res.json({ date, trends });
-
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// 3. Get top N stocks by % change or volume within a sector for a date
-app.get('/api/stocks/top', async (req, res) => {
-    try {
-        const { sector, date, sortBy = 'changePercent', order = 'desc', limit = 10 } = req.query;
-
-        if (!sector || !date) {
-            return res.status(400).json({ error: "sector and date query params required" });
-        }
-
-        const sortField = sortBy === 'volume' ? 'volume' : 'changePercent';
-        const sortOrder = order === 'asc' ? 1 : -1;
-
-        const stocks = await sectorIndicesCol.find({ sector, date })
-            .sort({ [sortField]: sortOrder })
-            .limit(parseInt(limit))
-            .toArray();
-
-        res.json({ sector, date, sortBy, order, count: stocks.length, stocks });
-
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// 4. Get full time-series sector strength for last N days (default 30 days)
-app.get('/api/sectors/timeseries', async (req, res) => {
-    try {
-        const { sector, days = 30 } = req.query;
-        if (!sector) return res.status(400).json({ error: "sector query param required" });
-
-        const fromDate = moment().subtract(days, 'days').format('YYYY-MM-DD');
-
-        const timeSeries = await sectorSummaryCol.find({
-            sector,
-            date: { $gte: fromDate }
+        const benchmarkSymbol = 'NIFTY 50';
+        const benchmarkData = await sectorIndicesCol.find({
+            sector: benchmarkSymbol,
+            symbol: benchmarkSymbol,
+            date: {
+                $gte: startDate.format('YYYY-MM-DD'),
+                $lte: endDate.format('YYYY-MM-DD')
+            }
         }).sort({ date: 1 }).toArray();
 
-        res.json({ sector, days, fromDate, timeSeries });
+        if (benchmarkData.length < days + 1) {
+            return res.status(500).json({ error: `Not enough benchmark data for ${benchmarkSymbol}` });
+        }
 
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
+        const benchmarkStart = benchmarkData[benchmarkData.length - days - 1].close;
+        const benchmarkEnd = benchmarkData[benchmarkData.length - 1].close;
+        const benchmarkChange = ((benchmarkEnd - benchmarkStart) / benchmarkStart) * 100;
 
-// 5. Trigger daily sector summary aggregation (run this manually or schedule with cron)
-app.post('/api/aggregate/daily-sector-summary', async (req, res) => {
-    try {
-        const date = req.body.date || moment().format('YYYY-MM-DD');
 
-        // Aggregate from sector_indices collection
         const pipeline = [
-            { $match: { date } },
+            {
+                $match: {
+                    date: {
+                        $gte: startDate.format('YYYY-MM-DD'),
+                        $lte: endDate.format('YYYY-MM-DD')
+                    },
+                    $expr: { $eq: ["$sector", "$symbol"] }
+                }
+            },
+            { $sort: { sector: 1, date: 1 } },
             {
                 $group: {
                     _id: "$sector",
-                    avgChangePercent: { $avg: "$changePercent" },
-                    totalVolume: { $sum: "$volume" },
-                    totalTurnover: { $sum: "$turnover" },
+                    dailyData: { $push: { date: "$date", changePercent: "$changePercent", volume: "$volume", turnover: "$turnover" } }
                 }
             },
-            {
-                $project: {
-                    sector: "$_id",
-                    date,
-                    avgChangePercent: 1,
-                    totalVolume: 1,
-                    totalTurnover: 1,
-                    _id: 0
-                }
-            }
+            { $project: { sector: "$_id", dailyData: 1, _id: 0 } }
         ];
 
-        const results = await sectorIndicesCol.aggregate(pipeline).toArray();
+        const sectorsData = await sectorIndicesCol.aggregate(pipeline).toArray();
 
-        for (const summary of results) {
-            await sectorSummaryCol.updateOne(
-                { sector: summary.sector, date },
-                { $set: summary },
-                { upsert: true }
-            );
-        }
+        const ranking = sectorsData.map(sector => {
+            const data = sector.dailyData;
+            if (data.length < days) return null;
 
-        res.json({ message: `Aggregated sector summary for date ${date}`, count: results.length });
+            const todaySlice = data.slice(-days);
+            const yesterdaySlice = data.slice(-(days + 1), -1);
 
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
+            const avgToday = todaySlice.reduce((sum, d) => sum + d.changePercent, 0) / days;
+            const avgYesterday = yesterdaySlice.reduce((sum, d) => sum + d.changePercent, 0) / days;
 
+            const totalVolume = todaySlice.reduce((sum, d) => sum + d.volume, 0);
+            const totalTurnover = todaySlice.reduce((sum, d) => sum + d.turnover, 0);
 
+            return {
+                sector: sector.sector,
+                avg5DayChange: parseFloat(avgToday.toFixed(2)),
+                trend: avgToday - avgYesterday > 0 ? 'strengthening' : 'weakening',
+                totalVolume,
+                totalTurnover
+            };
+        }).filter(Boolean);
 
+        // Sort sectors by avg5DayChange
+        ranking.sort((a, b) => b.avg5DayChange - a.avg5DayChange);
 
+        // Add labels based on gap and trend
+        if (ranking.length > 0) {
+            ranking[0].label = ranking[0].trend === 'weakening' ? 'Getting Weak' : 'Leading';
 
-
-
-
-
-
-
-
-
-
-
-
-
-// Helper: get moving average avgChangePercent over last N days for a sector
-async function getMovingAvg(sectorSummaryCol, sector, endDate, days = 3) {
-    const fromDate = moment(endDate).subtract(days - 1, 'days').format('YYYY-MM-DD');
-    const records = await sectorSummaryCol.find({
-        sector,
-        date: { $gte: fromDate, $lte: endDate }
-    }).toArray();
-    if (!records.length) return null;
-    const sum = records.reduce((acc, r) => acc + r.avgChangePercent, 0);
-    return sum / records.length;
-}
-
-app.get('/api/trading-signal', async (req, res) => {
-    try {
-        const date = req.query.date || moment().format('YYYY-MM-DD');
-        const yesterday = moment(date).subtract(1, 'day').format('YYYY-MM-DD');
-
-        const todayRanking = await sectorSummaryCol.find({ date }).sort({ avgChangePercent: -1 }).toArray();
-        const yesterdayRanking = await sectorSummaryCol.find({ date: yesterday }).sort({ avgChangePercent: -1 }).toArray();
-
-        if (!todayRanking.length || !yesterdayRanking.length) {
-            return res.status(404).json({ error: 'Insufficient data for the specified dates' });
-        }
-
-        const currentLeaderToday = todayRanking[0];
-        const nextLeaderToday = todayRanking.find(s => s.sector !== currentLeaderToday.sector) || null;
-
-        const currentLeader3DayAvg = await getMovingAvg(sectorSummaryCol, currentLeaderToday.sector, date, 3);
-        const nextLeader3DayAvg = nextLeaderToday
-            ? await getMovingAvg(sectorSummaryCol, nextLeaderToday.sector, date, 3)
-            : null;
-
-        // Today's actual changePercent for extra detail
-        const currentLeaderTodayChange = currentLeaderToday.avgChangePercent;
-        const nextLeaderTodayChange = nextLeaderToday ? nextLeaderToday.avgChangePercent : null;
-
-        const threshold = 0.5; // percentage points threshold to switch sectors
-
-        let signal = 'HOLD';
-        let reason = 'No significant changes detected';
-
-        if (currentLeader3DayAvg === null) {
-            signal = 'HOLD';
-            reason = `Insufficient moving average data for current leader (${currentLeaderToday.sector})`;
-        } else if (nextLeader3DayAvg === null) {
-            // No next leader data - stick with current leader
-            signal = 'BUY_CURRENT_HOLD_OTHERS';
-            reason = `No next leader data; holding current leader (${currentLeaderToday.sector})`;
-        } else {
-            if ((currentLeader3DayAvg + threshold) < nextLeader3DayAvg) {
-                signal = 'SELL_CURRENT_BUY_NEXT';
-                reason = `Current leader 3-day avg (${currentLeader3DayAvg.toFixed(2)}%) weaker than next leader 3-day avg (${nextLeader3DayAvg.toFixed(2)}%) by >${threshold}%`;
-            } else {
-                signal = 'BUY_CURRENT_HOLD_OTHERS';
-                reason = `Current leader remains stronger or no significant difference`;
+            if (ranking.length > 1) {
+                const gap = ranking[0].avg5DayChange - ranking[1].avg5DayChange;
+                if (gap < gapThreshold && ranking[1].trend === 'strengthening') {
+                    ranking[1].label = 'Next Leader';
+                }
             }
         }
 
         res.json({
-            date,
-            currentLeader: currentLeaderToday.sector,
-            nextLeader: nextLeaderToday ? nextLeaderToday.sector : null,
-            signal,
-            reason,
-            details: {
-                currentLeader: {
-                    "3DayAvgChangePercent": Number(currentLeader3DayAvg?.toFixed(2)) || null,
-                    "todayChangePercent": Number(currentLeaderTodayChange.toFixed(2))
-                },
-                nextLeader: {
-                    "3DayAvgChangePercent": Number(nextLeader3DayAvg?.toFixed(2)) || null,
-                    "todayChangePercent": nextLeaderTodayChange !== null ? Number(nextLeaderTodayChange.toFixed(2)) : null
-                }
-            }
+            date: endDate.format('YYYY-MM-DD'),
+            days,
+            threshold: gapThreshold,
+            ranking
         });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
+
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
+
+
+app.get('/api/stocks/ranking', async (req, res) => {
+    try {
+        const sector = req.query.sector;
+        const days = parseInt(req.query.days) || 5; // for momentum calculation
+        const volumeThreshold = parseInt(req.query.volume) || 100000; // minimum avg volume
+        const endDate = moment(req.query.date || undefined).endOf('day');
+        const startDate = moment(endDate).subtract(30, 'days').startOf('day'); // last 30 days for calculations
+
+        if (!sector) return res.status(400).json({ error: "sector parameter is required" });
+
+        // Fetch stock price data
+        const pipeline = [
+            {
+                $match: {
+                    sector,
+                    date: { $gte: startDate.format('YYYY-MM-DD'), $lte: endDate.format('YYYY-MM-DD') }
+                }
+            },
+            { $sort: { symbol: 1, date: 1 } },
+            {
+                $group: {
+                    _id: "$symbol",
+                    dailyData: { $push: { date: "$date", open: "$open", high: "$high", low: "$low", close: "$close", volume: "$volume" } }
+                }
+            }
+        ];
+
+        const stocksData = await stockPriceCol.aggregate(pipeline).toArray();
+
+        const rankedStocks = stocksData.map(stock => {
+            const data = stock.dailyData;
+
+            if (data.length < 20) return null; // need at least 20 days for DMA20 and ATR10
+
+            // Moving averages
+            const calcDMA = (n) => data.slice(-n).reduce((sum, d) => sum + d.close, 0) / n;
+            const dma5 = calcDMA(5);
+            const dma10 = calcDMA(10);
+            const dma20 = calcDMA(20);
+
+            // Average volume
+            const avgVolume = data.slice(-days).reduce((sum, d) => sum + d.volume, 0) / days;
+
+            // Last N-day % change
+            const change5Day = ((data[data.length - 1].close - data[data.length - days].close) / data[data.length - days].close) * 100;
+
+            const rs = change5Day - benchmarkChange;
+
+            // ATR(10) calculation
+            const trueRanges = [];
+            for (let i = data.length - 10; i < data.length; i++) {
+                const curr = data[i];
+                const prevClose = i > 0 ? data[i - 1].close : curr.close;
+                const tr = Math.max(
+                    curr.high - curr.low,
+                    Math.abs(curr.high - prevClose),
+                    Math.abs(curr.low - prevClose)
+                );
+                trueRanges.push(tr);
+            }
+            const atr10 = trueRanges.reduce((sum, tr) => sum + tr, 0) / trueRanges.length;
+
+            // Filter: above DMAs and volume threshold
+            if (data[data.length - 1].close < dma5 || data[data.length - 1].close < dma10 || data[data.length - 1].close < dma20) return null;
+            if (avgVolume < volumeThreshold) return null;
+
+            return {
+                symbol: stock._id,
+                sector,
+                close: data[data.length - 1].close,
+                dma5: parseFloat(dma5.toFixed(2)),
+                dma10: parseFloat(dma10.toFixed(2)),
+                dma20: parseFloat(dma20.toFixed(2)),
+                avgVolume: parseInt(avgVolume),
+                change5Day: parseFloat(change5Day.toFixed(2)),
+                atr10: parseFloat(atr10.toFixed(2)),
+                rs: parseFloat(rs.toFixed(2)) // ✅ Relative Strength added
+            };
+        }).filter(Boolean);
+
+        // Rank from leading to lagging by 5-day % change
+        rankedStocks.sort((a, b) => b.change5Day - a.change5Day);
+        rankedStocks.forEach((s, idx) => s.rank = idx + 1);
+
+        res.json({
+            sector,
+            days,
+            volumeThreshold,
+            count: rankedStocks.length,
+            stocks: rankedStocks
+        });
+
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+
+
+
+
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
